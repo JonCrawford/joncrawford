@@ -1,4 +1,6 @@
 ## Hi there 👋
+![https://github.com/joncrawford/github-readme-stats](https://github-readme-stats-iota-jade-16.vercel.app/api?username=joncrawford&include_all_commits=true&rank_icon=github&show_icons=true&theme=dracula)
+
 
 <!--
 **JonCrawford/joncrawford** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
