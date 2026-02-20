@@ -1,0 +1,998 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Gizmo’s Table Scraps (16-bit + Starving Meter)</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { height: 100%; margin: 0; background:#05060a; overflow:hidden; }
+    canvas { display:block; width:100vw; height:100vh; image-rendering: pixelated; image-rendering: crisp-edges; }
+    .tip {
+      position: fixed; left: 10px; bottom: 10px;
+      font-family: ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(0,0,0,.35);
+      border: 1px solid rgba(255,255,255,.10);
+      color: rgba(255,255,255,.85);
+      user-select:none;
+      backdrop-filter: blur(8px);
+      line-height: 1.25;
+      max-width: min(1100px, 94vw);
+    }
+    .tip b { color:#fff; }
+  </style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<div class="tip">
+  <b>Move</b>: ← → / A D · <b>Dash</b>: Shift · <b>Slurp</b>: X / ↑ (pull nearby) ·
+  <b>Start/Pause</b>: Space · <b>Restart</b>: R · <b>Mute</b>: M · <b>Music</b>: B · <b>Vol</b>: - +
+</div>
+
+<script>
+(() => {
+  // ======== PIXEL / RENDER SETUP ========
+  const screen = document.getElementById('screen');
+  const sctx = screen.getContext('2d');
+
+  const buf = document.createElement('canvas');
+  const bctx = buf.getContext('2d');
+
+  const BASE_H = 180;
+  let BW = 320, BH = BASE_H;
+  let scale = 3, ox = 0, oy = 0;
+
+  function resize() {
+    const W = window.innerWidth, H = window.innerHeight;
+    screen.width = Math.floor(W * devicePixelRatio);
+    screen.height = Math.floor(H * devicePixelRatio);
+    sctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+
+    const aspect = W / H;
+    BH = BASE_H;
+    BW = Math.max(256, Math.min(560, Math.round(BH * aspect)));
+    buf.width = BW;
+    buf.height = BH;
+
+    scale = Math.max(2, Math.floor(Math.min(W / BW, H / BH)));
+    const rw = BW * scale, rh = BH * scale;
+    ox = Math.floor((W - rw) / 2);
+    oy = Math.floor((H - rh) / 2);
+
+    sctx.imageSmoothingEnabled = false;
+    bctx.imageSmoothingEnabled = false;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ======== UTIL ========
+  const rand  = (a,b) => a + Math.random()*(b-a);
+  const randi = (a,b) => Math.floor(rand(a,b+1));
+  const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+  const now   = () => performance.now();
+
+  function pxFill(x,y,w,h,c){ bctx.fillStyle=c; bctx.fillRect(x|0,y|0,w|0,h|0); }
+  function pxText(txt,x,y,c){
+    bctx.fillStyle = c;
+    bctx.font = '8px ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace';
+    bctx.textBaseline='top';
+    bctx.fillText(txt, x|0, y|0);
+  }
+  function outlineRect(x,y,w,h,c){
+    bctx.strokeStyle=c;
+    bctx.lineWidth=1;
+    bctx.strokeRect((x|0)+.5,(y|0)+.5,w|0,h|0);
+  }
+
+  // ======== AUDIO (WEB AUDIO, NO FILES) ========
+  const Audio = {
+    ctx: null,
+    master: null,
+    gain: 0.45,
+    muted: false,
+    musicOn: true,
+    music: { nextT: 0, step: 0, isActive: false },
+
+    ensure() {
+      if (this.ctx) return;
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      this.ctx = new Ctx();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = this.muted ? 0 : this.gain;
+      this.master.connect(this.ctx.destination);
+    },
+    setMute(v) { this.muted = v; if (this.master) this.master.gain.value = v ? 0 : this.gain; },
+    setGain(g) { this.gain = clamp(g,0,1); if (this.master) this.master.gain.value = this.muted ? 0 : this.gain; },
+
+    beep({freq=440, dur=0.08, type='square', vol=0.7, attack=0.005, decay=0.06, slide=0, detune=0} = {}) {
+      if (!this.ctx || !this.master) return;
+      const t0 = this.ctx.currentTime;
+      const o = this.ctx.createOscillator();
+      const g = this.ctx.createGain();
+      o.type = type;
+      o.detune.value = detune;
+
+      const f0 = Math.max(40, freq);
+      o.frequency.setValueAtTime(f0, t0);
+      if (slide !== 0) o.frequency.exponentialRampToValueAtTime(Math.max(40, f0 + slide), t0 + dur);
+
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.linearRampToValueAtTime(vol, t0 + attack);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + attack + decay);
+
+      o.connect(g); g.connect(this.master);
+      o.start(t0); o.stop(t0 + dur + 0.02);
+    },
+    chord(freqs, dur=0.12, type='square', vol=0.16) {
+      for (let i=0;i<freqs.length;i++){
+        this.beep({freq: freqs[i], dur, type, vol, attack:0.003, decay:dur*0.85, detune:(i-1)*3});
+      }
+    },
+    sfx(name) {
+      if (!this.ctx) return;
+      switch (name) {
+        case 'start':    this.beep({freq:660, dur:0.07, type:'square', vol:0.55, slide:120}); break;
+        case 'pause':    this.beep({freq:330, dur:0.07, type:'square', vol:0.45, slide:-60}); break;
+        case 'catch':    this.beep({freq:880, dur:0.06, type:'square', vol:0.50, slide:80}); break;
+        case 'bonus':    this.chord([523.25, 659.25, 783.99], 0.10, 'square', 0.14); break;
+        case 'power':    this.beep({freq:440, dur:0.10, type:'triangle', vol:0.50, slide:440}); break;
+        case 'bad':      this.chord([220, 233.08, 246.94], 0.10, 'sawtooth', 0.10); break;
+        case 'miss':     this.beep({freq:210, dur:0.07, type:'triangle', vol:0.30, slide:-90}); break;
+        case 'dash':     this.beep({freq:520, dur:0.06, type:'square', vol:0.35, slide:260}); break;
+        case 'slurp':    this.beep({freq:300, dur:0.12, type:'triangle', vol:0.45, slide:520}); break;
+        case 'danger':   this.beep({freq:180, dur:0.12, type:'sawtooth', vol:0.22, slide:-30}); break;
+        case 'gameover':
+          this.beep({freq:392, dur:0.10, type:'triangle', vol:0.40, slide:-120});
+          setTimeout(()=>this.beep({freq:330, dur:0.10, type:'triangle', vol:0.36, slide:-120}), 90);
+          setTimeout(()=>this.beep({freq:262, dur:0.16, type:'triangle', vol:0.34, slide:-80}), 180);
+          break;
+      }
+    },
+
+    startMusic() { if (!this.ctx) return; this.music.isActive = true; this.music.nextT = Math.max(this.music.nextT, this.ctx.currentTime + 0.03); },
+    stopMusic()  { this.music.isActive = false; },
+
+    tickMusic(isGameplayActive) {
+      if (!this.ctx || !this.master) return;
+      if (!this.musicOn || !isGameplayActive) return;
+      if (!this.music.isActive) this.startMusic();
+
+      const stepDur = 0.125;
+      const lookAhead = 0.20;
+
+      // light “kitchen chiptune”
+      const pattern = [
+        440, 523.25, 659.25, 523.25,
+        392, 493.88, 587.33, 493.88,
+        349.23, 440, 523.25, 440,
+        392, 440, 493.88, 440
+      ];
+      const bass = [
+        110, 0, 0, 0,
+        98,  0, 0, 0,
+        87.31,0,0,0,
+        98,  0, 0, 0
+      ];
+
+      while (this.music.nextT < this.ctx.currentTime + lookAhead) {
+        const i = this.music.step % pattern.length;
+        const f = pattern[i];
+        const b = bass[i];
+
+        if (f) {
+          const t0 = this.music.nextT;
+          const o = this.ctx.createOscillator();
+          const g = this.ctx.createGain();
+          o.type = 'square';
+          o.frequency.setValueAtTime(f, t0);
+          g.gain.setValueAtTime(0.0001, t0);
+          g.gain.linearRampToValueAtTime(0.11, t0 + 0.004);
+          g.gain.exponentialRampToValueAtTime(0.0001, t0 + stepDur * 0.92);
+          o.connect(g); g.connect(this.master);
+          o.start(t0); o.stop(t0 + stepDur);
+        }
+        if (b) {
+          const t0 = this.music.nextT;
+          const o = this.ctx.createOscillator();
+          const g = this.ctx.createGain();
+          o.type = 'triangle';
+          o.frequency.setValueAtTime(b, t0);
+          g.gain.setValueAtTime(0.0001, t0);
+          g.gain.linearRampToValueAtTime(0.07, t0 + 0.004);
+          g.gain.exponentialRampToValueAtTime(0.0001, t0 + stepDur * 0.95);
+          o.connect(g); g.connect(this.master);
+          o.start(t0); o.stop(t0 + stepDur);
+        }
+
+        this.music.step++;
+        this.music.nextT += stepDur;
+      }
+    }
+  };
+
+  function unlockAudioOnce() {
+    Audio.ensure();
+    if (Audio.ctx && Audio.ctx.state === 'suspended') Audio.ctx.resume();
+  }
+
+  // ======== WORLD ========
+  const world = {
+    tableY: 44,
+    tableTopH: 10,
+    tableLipH: 5,
+    floorY: () => BH - 22,
+    left: () => 14,
+    right: () => BW - 14,
+  };
+
+  // ======== INPUT (FIXED KEYBOARD RELIABILITY) ========
+  // Keyboard stopped “working” before because pointer mode could keep overriding it.
+  // This adds an explicit control mode: keys win until you move the pointer intentionally.
+  const input = {
+    left:false, right:false, dash:false, slurp:false,
+    mode:'keys', // 'keys' | 'pointer'
+    targetX:null,
+    lastKeyMs: 0,
+    lastPointerMs: 0,
+  };
+
+  function screenToWorldX(clientX){
+    const x = clientX - ox;
+    return clamp(Math.round(x / scale), 0, BW);
+  }
+
+  function setKeysMode() {
+    input.mode = 'keys';
+    input.lastKeyMs = now();
+    input.targetX = null; // stop pointer override immediately
+  }
+
+  function maybeSetPointerMode(x) {
+    // Only switch to pointer mode if it's a real move AND not within a recent key press.
+    const t = now();
+    const recentKeys = (t - input.lastKeyMs) < 220;
+    if (recentKeys) return;
+
+    input.mode = 'pointer';
+    input.lastPointerMs = t;
+    input.targetX = x;
+  }
+
+  function handleKeydown(e) {
+    unlockAudioOnce();
+
+    const code = e.code;
+
+    // Prevent scrolling / browser hotkeys for the ones we own
+    const owned = new Set([
+      'ArrowLeft','ArrowRight','ArrowUp','Space',
+      'KeyA','KeyD','KeyX','ShiftLeft','ShiftRight',
+      'KeyR','KeyM','KeyB','Minus','Equal','NumpadAdd','NumpadSubtract'
+    ]);
+    if (owned.has(code)) e.preventDefault();
+
+    if (code === 'ArrowLeft' || code === 'KeyA') { input.left = true; setKeysMode(); }
+    if (code === 'ArrowRight' || code === 'KeyD') { input.right = true; setKeysMode(); }
+    if (code === 'ShiftLeft' || code === 'ShiftRight') input.dash = true;
+    if (code === 'KeyX' || code === 'ArrowUp') input.slurp = true;
+
+    if (code === 'Space') {
+      if (!state.running) start();
+      else togglePause();
+    }
+    if (code === 'KeyR') restart();
+    if (code === 'KeyM') Audio.setMute(!Audio.muted);
+    if (code === 'KeyB') { Audio.musicOn = !Audio.musicOn; if (!Audio.musicOn) Audio.stopMusic(); }
+    if (code === 'Minus' || code === 'NumpadSubtract') Audio.setGain(Audio.gain - 0.08);
+    if (code === 'Equal' || code === 'NumpadAdd') Audio.setGain(Audio.gain + 0.08);
+  }
+
+  function handleKeyup(e) {
+    const code = e.code;
+    if (code === 'ArrowLeft' || code === 'KeyA') input.left = false;
+    if (code === 'ArrowRight' || code === 'KeyD') input.right = false;
+    if (code === 'ShiftLeft' || code === 'ShiftRight') input.dash = false;
+    if (code === 'KeyX' || code === 'ArrowUp') input.slurp = false;
+  }
+
+  // Capture on document so it works even if canvas isn't focused
+  document.addEventListener('keydown', handleKeydown, { capture: true, passive: false });
+  document.addEventListener('keyup', handleKeyup, { capture: true, passive: true });
+
+  window.addEventListener('mousemove', (e) => {
+    const x = screenToWorldX(e.clientX);
+    // Ignore tiny jitter so keyboard doesn't “lose” control
+    if (input.targetX === null || Math.abs(x - input.targetX) >= 2) maybeSetPointerMode(x);
+  });
+
+  window.addEventListener('touchstart', (e) => {
+    unlockAudioOnce();
+    if (e.touches[0]) maybeSetPointerMode(screenToWorldX(e.touches[0].clientX));
+  }, {passive:true});
+
+  window.addEventListener('touchmove', (e) => {
+    if (e.touches[0]) maybeSetPointerMode(screenToWorldX(e.touches[0].clientX));
+  }, {passive:true});
+
+  window.addEventListener('pointerdown', () => {
+    unlockAudioOnce();
+    if (!state.running) start();
+    else if (state.paused) togglePause();
+  });
+
+  // ======== GAME STATE (STARVING DYNAMICS) ========
+  // Starving goes UP:
+  //  - constantly over time
+  //  - extra on misses (more if you're doing well)
+  // Starving goes DOWN:
+  //  - on catches (food-dependent "feed" values)
+  // Game ends if Starving reaches 100.
+  const state = {
+    running: false,
+    paused: true,
+    lastT: now(),
+    tAlive: 0,
+
+    score: 0,
+    best: 0,
+    streak: 0,
+    caught: 0,
+    missed: 0,
+
+    starving: 35, // starts hungry but not doomed
+    dangerPulseT: 0,
+
+    level: 1,
+
+    scraps: [],
+    particles: [],
+    floaters: [],
+
+    magnetTime: 0,
+    slowTime: 0,
+
+    dashTime: 0,
+    dashCooldown: 0,
+
+    slurpTime: 0,
+    slurpCooldown: 0,
+
+    twinkleT: 0
+  };
+
+  // ======== GIZMO ========
+  const gizmo = { x: 160, y: 0, vx: 0, speed: 220, mouth: 0, bob: 0 };
+
+  function resetGizmo(){
+    gizmo.x = Math.floor(BW/2);
+    gizmo.y = world.floorY() - 14;
+    gizmo.vx = 0;
+    gizmo.mouth = 0;
+    gizmo.bob = 0;
+  }
+  resetGizmo();
+
+  function drawGizmo(){
+    const x = gizmo.x|0, y = gizmo.y|0;
+    const bob = Math.round(Math.sin(gizmo.bob)*1);
+
+    pxFill(x-11, world.floorY()+4, 22, 3, 'rgba(0,0,0,0.35)');
+
+    pxFill(x-12, y+6+bob, 24, 9, '#0b0e16');
+    pxFill(x-10, y+5+bob, 20, 2, '#0f1420');
+    pxFill(x-10, y+14+bob, 4, 2, '#070a10');
+    pxFill(x-2,  y+14+bob, 4, 2, '#070a10');
+    pxFill(x+6,  y+14+bob, 4, 2, '#070a10');
+
+    pxFill(x-10, y-1+bob, 20, 12, '#0a0d15');
+    pxFill(x-8,  y+bob,   16, 2,  '#10182a');
+    pxFill(x-12, y-2+bob, 5, 6, '#070a10');
+    pxFill(x+7,  y-2+bob, 5, 6, '#070a10');
+
+    pxFill(x-5, y+5+bob, 10, 6, '#070911');
+    pxFill(x-6, y+2+bob, 3, 3, '#eaf6ff');
+    pxFill(x+3, y+2+bob, 3, 3, '#eaf6ff');
+    pxFill(x-5, y+3+bob, 1, 1, '#1b4a7a');
+    pxFill(x+4, y+3+bob, 1, 1, '#1b4a7a');
+
+    pxFill(x-2, y+6+bob, 4, 2, '#010103');
+
+    const m = gizmo.mouth;
+    pxFill(x-3, y+8+bob, 6, 1, 'rgba(255,255,255,0.18)');
+    if (m > 0.02) {
+      pxFill(x-2, y+9+bob, 4, 1, '#ff6aa6');
+      pxFill(x-3, y+10+bob, 6, 1, '#05060a');
+    }
+
+    pxFill(x-10, y+11+bob, 20, 2, '#c0182b');
+    pxFill(x-2,  y+11+bob, 4, 2, '#ffcf4d');
+
+    if (state.running && !state.paused && state.slurpCooldown <= 0) {
+      pxFill(x-1, y-10, 2, 2, 'rgba(86,255,150,0.45)');
+    }
+  }
+
+  // ======== FUNNY FOOD TYPES (PIXEL SPRITES + NUTRITION) ========
+  // feed: how much it lowers starving on catch
+  // base: score points (negative = gross mistake)
+  const FoodTypes = [
+    { name:'Couch Fry (Vintage)', base: 14, feed: 12, rarity: 1.0, draw:(x,y)=>{
+      pxFill(x-3,y-3,6,6,'#5a3a1a'); pxFill(x-2,y-4,1,7,'#ffd35a'); pxFill(x,y-4,1,7,'#ffd35a'); pxFill(x+2,y-4,1,7,'#ffd35a');
+    }},
+    { name:'Nacho Shard of Power', base: 11, feed: 9, rarity: 1.0, draw:(x,y)=>{
+      pxFill(x-4,y-2,8,4,'#ffcf4d'); pxFill(x-2,y-3,4,1,'#ffdca0'); pxFill(x-1,y,2,1,'#e58f2a');
+    }},
+    { name:'Half-Eaten Taco (Hero)', base: 18, feed: 16, rarity: 0.85, draw:(x,y)=>{
+      pxFill(x-5,y-2,10,4,'#c77a22'); pxFill(x-4,y-1,8,2,'#2bdc74'); pxFill(x-2,y-1,4,1,'#ff6aa6');
+    }},
+    { name:'Mysterious Meatball', base: 16, feed: 13, rarity: 0.9, draw:(x,y)=>{
+      pxFill(x-4,y-4,8,8,'#a14f2a'); pxFill(x-2,y-2,1,1,'#d28a5e'); pxFill(x+1,y,1,1,'#d28a5e');
+    }},
+    { name:'Floor Grape (Probably Fine)', base: 9, feed: 7, rarity: 1.0, draw:(x,y)=>{
+      pxFill(x-3,y-3,6,6,'#7a3bd1'); pxFill(x-2,y-2,2,2,'#c9a2ff'); pxFill(x+1,y-1,1,1,'#c9a2ff');
+    }},
+    { name:'Soggy Crouton', base: 8, feed: 6, rarity: 1.0, draw:(x,y)=>{
+      pxFill(x-3,y-3,6,6,'#b07a4e'); pxFill(x-2,y-2,2,2,'#d2a27a'); pxFill(x+1,y+1,1,1,'#8b5a38');
+    }},
+    { name:'Wet Lettuce (Sad)', base: 6, feed: 9, rarity: 0.95, draw:(x,y)=>{
+      pxFill(x-4,y-3,8,6,'#1fbf5f'); pxFill(x-3,y-2,2,2,'#56ff96'); pxFill(x+1,y+1,2,1,'#128a44');
+    }},
+    { name:'Single Onion Ring Portal', base: 22, feed: 10, rarity: 0.5, onCatch:()=>{ state.magnetTime = 5.0; Audio.sfx('power'); }, draw:(x,y)=>{
+      pxFill(x-5,y-5,10,10,'#d7a52b'); pxFill(x-3,y-3,6,6,'#05060a'); pxFill(x-4,y-4,8,1,'#fff2b0');
+    }},
+    { name:'Ice Cube of Time', base: 10, feed: 8, rarity: 0.38, onCatch:()=>{ state.slowTime = 5.0; Audio.sfx('power'); }, draw:(x,y)=>{
+      pxFill(x-4,y-4,8,8,'#89d6ff'); pxFill(x-3,y-3,6,6,'#c9f0ff'); pxFill(x-2,y-2,4,4,'#89d6ff');
+    }},
+    { name:'Steak of Destiny (GOLD)', base: 55, feed: 12, rarity: 0.16, onCatch:()=>{ state.magnetTime = 7.0; Audio.sfx('power'); }, draw:(x,y)=>{
+      pxFill(x-5,y-3,10,6,'#ffcf4d'); pxFill(x-4,y-2,8,4,'#ff8b2e'); pxFill(x-2,y-1,4,2,'#fff2b0'); pxFill(x-6,y-4,12,1,'rgba(255,255,255,0.25)');
+    }},
+    // Bad items (raise starving + negative points)
+    { name:'Sock (Not Food)', base: -15, feed: -18, bad:true, rarity: 0.28, draw:(x,y)=>{
+      pxFill(x-4,y-4,8,8,'#6a7080'); pxFill(x-2,y-4,4,1,'#8b93a6'); pxFill(x-1,y+2,2,2,'#4e5462');
+    }},
+    { name:'Ghost Pepper Regret', base: -20, feed: -14, bad:true, rarity: 0.26, draw:(x,y)=>{
+      pxFill(x-2,y-4,4,8,'#ff2b4f'); pxFill(x-1,y-3,2,1,'#ff9bb0'); pxFill(x-1,y-5,2,1,'#21d16c');
+    }},
+  ];
+
+  function pickFoodType(){
+    const total = FoodTypes.reduce((s,t)=>s+t.rarity,0);
+    let r = Math.random()*total;
+    for (const t of FoodTypes){ r -= t.rarity; if (r<=0) return t; }
+    return FoodTypes[0];
+  }
+
+  // ======== SCRAPS ========
+  function spawnScrap(){
+    const t = pickFoodType();
+    const x = randi(world.left()+18, world.right()-18);
+    const y = world.tableY + 10;
+
+    // Algorithmic challenge:
+    // - difficulty increases with time alive AND with low starving (if you're comfortable, it ramps)
+    const comfort = clamp((60 - state.starving) / 60, 0, 1);  // 0 when starving high, 1 when comfy
+    const diff = 1 + (state.tAlive / 35) + comfort*0.9;       // ramps faster if you're doing great
+    const diffClamped = clamp(diff, 1, 4.2);
+
+    state.scraps.push({
+      x, y,
+      vx: rand(-12,12) * (1 + diffClamped*0.08),
+      vy: rand(36, 52) + diffClamped*9,
+      wob: rand(0.8, 1.4),
+      wT: rand(0, Math.PI*2),
+      type: t,
+      sparkle: (t.name.includes('GOLD') || t.name.includes('Portal')) ? rand(0,1) : 0,
+      pulled: 0
+    });
+  }
+
+  // ======== PARTICLES + FLOATING TEXT ========
+  function pop(x,y, count, palette){
+    for (let i=0;i<count;i++){
+      state.particles.push({
+        x, y,
+        vx: rand(-45,45),
+        vy: rand(-85,-25),
+        g: rand(140, 210),
+        t: 0,
+        life: rand(0.25,0.55),
+        c: palette ? palette[randi(0, palette.length-1)] : ['#ffffff','#89d6ff','#ff6aa6','#ffd35a','#56ff96'][randi(0,4)]
+      });
+    }
+  }
+
+  function floatText(x,y,msg,color){
+    state.floaters.push({ x, y, msg, color, t:0, life:0.9, vy:-18 });
+  }
+
+  // ======== GAME FLOW ========
+  function start(){
+    state.running = true;
+    state.paused = false;
+    state.lastT = now();
+    Audio.sfx('start');
+  }
+
+  function togglePause(){
+    state.paused = !state.paused;
+    if (!state.paused) { state.lastT = now(); Audio.sfx('start'); }
+    else { Audio.sfx('pause'); }
+  }
+
+  function restart(){
+    state.running = true;
+    state.paused = false;
+    state.lastT = now();
+    state.tAlive = 0;
+
+    state.score = 0;
+    state.streak = 0;
+    state.caught = 0;
+    state.missed = 0;
+
+    state.starving = 35;
+
+    state.scraps.length = 0;
+    state.particles.length = 0;
+    state.floaters.length = 0;
+
+    state.magnetTime = 0;
+    state.slowTime = 0;
+    state.dashTime = 0;
+    state.dashCooldown = 0;
+    state.slurpTime = 0;
+    state.slurpCooldown = 0;
+
+    resetGizmo();
+    update.spawnT = 0;
+
+    Audio.sfx('start');
+  }
+
+  function gameOver(){
+    state.running = false;
+    state.paused = true;
+    state.best = Math.max(state.best, state.score);
+    Audio.sfx('gameover');
+  }
+
+  // ======== BACKGROUND ========
+  function drawBackground(){
+    for (let y=0; y<BH; y++){
+      const t = y/BH;
+      const r = Math.round(10 + 40*t);
+      const g = Math.round(18 + 60*t);
+      const b = Math.round(35 + 90*t);
+      bctx.fillStyle = `rgb(${r},${g},${b})`;
+      bctx.fillRect(0,y,BW,1);
+    }
+
+    for (let x=0; x<BW; x+=10) pxFill(x, 0, 2, world.tableY-6, 'rgba(255,255,255,0.06)');
+
+    // window
+    pxFill(14, 14, 58, 34, '#0b1430');
+    pxFill(16, 16, 54, 30, '#122a6a');
+    state.twinkleT += 0.01;
+    for (let i=0;i<18;i++){
+      const sx = 18 + ((i*7 + 13) % 52);
+      const sy = 18 + ((i*11 + 5) % 26);
+      const on = (Math.sin(state.twinkleT + i*0.8) > 0.2);
+      if (on) pxFill(sx, sy, 1, 1, '#eaf6ff');
+    }
+    outlineRect(14,14,58,34,'rgba(255,255,255,0.25)');
+    pxFill(42,14,2,34,'rgba(255,255,255,0.18)');
+    pxFill(14,31,58,2,'rgba(255,255,255,0.18)');
+
+    // table
+    const ty = world.tableY;
+    pxFill(0, ty, BW, world.tableTopH, '#6b3b22');
+    pxFill(0, ty+2, BW, 2, '#8f563b');
+    pxFill(0, ty+world.tableTopH, BW, world.tableLipH, '#3a1f12');
+
+    // legs
+    const legY = ty+world.tableTopH+world.tableLipH;
+    const legH = world.floorY() - legY + 6;
+    pxFill(28, legY, 10, legH, '#4b2a18');
+    pxFill(BW-38, legY, 10, legH, '#4b2a18');
+    pxFill(30, legY, 2, legH, 'rgba(255,255,255,0.10)');
+    pxFill(BW-36, legY, 2, legH, 'rgba(255,255,255,0.10)');
+
+    // floor
+    const fy = world.floorY();
+    pxFill(0, fy, BW, BH-fy, '#151a28');
+    for (let y=fy; y<BH; y+=8){
+      for (let x=0; x<BW; x+=8){
+        const odd = ((x/8 + y/8) | 0) % 2;
+        pxFill(x,y,8,8, odd ? '#141c2e' : '#101729');
+      }
+    }
+    pxFill(0, fy, BW, 1, 'rgba(255,255,255,0.18)');
+
+    // sign
+    pxFill(BW-156, 14, 140, 16, 'rgba(0,0,0,0.25)');
+    outlineRect(BW-156,14,140,16,'rgba(255,255,255,0.16)');
+    pxText('KEEP GIZMO ALIVE', BW-152, 18, '#56ff96');
+  }
+
+  // ======== HUD (STARVING METER) ========
+  function starvingColor(v){
+    if (v < 45) return '#56ff96';
+    if (v < 75) return '#ffd35a';
+    return '#ff2b4f';
+  }
+
+  function drawHUD(){
+    pxFill(0,0,BW,16,'rgba(0,0,0,0.35)');
+    outlineRect(0,0,BW,16,'rgba(255,255,255,0.10)');
+
+    const st = clamp(state.starving, 0, 100);
+    const barW = 120;
+    const barX = 6;
+    const barY = 6;
+
+    // starving bar frame
+    pxFill(barX-1, barY-1, barW+2, 7, 'rgba(0,0,0,0.40)');
+    outlineRect(barX-1, barY-1, barW+2, 7, 'rgba(255,255,255,0.18)');
+    pxFill(barX, barY, barW, 5, 'rgba(255,255,255,0.06)');
+
+    const fill = Math.round(barW * (st/100));
+    pxFill(barX, barY, fill, 5, starvingColor(st));
+
+    const mag  = state.magnetTime > 0 ? ` MAG:${state.magnetTime.toFixed(0)} ` : '';
+    const slow = state.slowTime > 0 ? ` SLOW:${state.slowTime.toFixed(0)} ` : '';
+    const dash = state.dashCooldown > 0 ? ` DASH:${state.dashCooldown.toFixed(0)} ` : ' DASH:OK ';
+    const slrp = state.slurpCooldown > 0 ? ` SLURP:${state.slurpCooldown.toFixed(0)} ` : ' SLURP:OK ';
+    const music = Audio.musicOn ? 'MUS:ON' : 'MUS:OFF';
+    const mute  = Audio.muted ? 'MUTE' : `VOL:${Math.round(Audio.gain*10)}`;
+
+    pxText(
+      `STARVING:${st.toFixed(0)}%  SCORE:${state.score}  STK:${state.streak}  C:${state.caught} M:${state.missed}  ${dash}${slrp}${mag}${slow} ${music} ${mute}`,
+      132, 4, '#eaf6ff'
+    );
+
+    pxFill(0,BH-10, BW, 10, 'rgba(0,0,0,0.22)');
+    pxText('Catch lowers STARVING. Miss raises it. Starving=100 -> Gizmo eats the table leg.', 6, BH-9, '#ffd35a');
+  }
+
+  function drawOverlay(){
+    if (!state.running && state.paused) {
+      const msg1 = 'GIZMO’S TABLE SCRAPS';
+      const msg2 = `BEST:${state.best}  LAST:${state.score}`;
+      const msg3 = 'SPACE:PLAY  R:RESET  X/↑:SLURP  SHIFT:DASH';
+      const msg4 = 'STARVING rises over time + misses. Catch to survive.';
+
+      pxFill(14, 54, BW-28, 68, 'rgba(0,0,0,0.58)');
+      outlineRect(14,54,BW-28,68,'rgba(255,255,255,0.18)');
+      pxText(msg1, Math.floor(BW/2) - (msg1.length*4), 62, '#56ff96');
+      pxText(msg2, Math.floor(BW/2) - (msg2.length*4), 74, '#eaf6ff');
+      pxText(msg4, Math.floor(BW/2) - (msg4.length*4), 86, '#ffd35a');
+      pxText(msg3, Math.floor(BW/2) - (msg3.length*4), 98, '#ff6aa6');
+    } else if (state.paused) {
+      const msg = 'PAUSED  (SPACE)';
+      pxFill(60, 72, BW-120, 24, 'rgba(0,0,0,0.55)');
+      outlineRect(60,72,BW-120,24,'rgba(255,255,255,0.18)');
+      pxText(msg, Math.floor(BW/2) - (msg.length*4), 78, '#ffd35a');
+    }
+  }
+
+  // ======== MECHANICS ========
+  function applySlurp(dt){
+    if (state.slurpTime <= 0) return;
+
+    const radius = 30;
+    const cx = gizmo.x;
+    const cy = gizmo.y + 6;
+
+    for (const s of state.scraps) {
+      const dx = cx - s.x;
+      const dy = cy - s.y;
+      const d2 = dx*dx + dy*dy;
+
+      if (d2 <= radius*radius) {
+        const inv = 1 / Math.max(1, Math.sqrt(d2));
+        const pull = 200 * inv;
+        s.vx += dx * pull * dt;
+        s.vy += dy * pull * dt;
+        s.pulled = 0.25;
+      }
+    }
+  }
+
+  function starvationTick(dt){
+    // Passive hunger increases (ramps with time + low starving -> more pressure when you're doing well)
+    const comfort = clamp((60 - state.starving) / 60, 0, 1);
+    const diff = clamp(1 + (state.tAlive/40) + comfort*0.8, 1, 4.0);
+    const passive = (3.6 + diff*1.6) * dt;   // ~5.2..10.0 per second later
+    state.starving = clamp(state.starving + passive, 0, 100);
+
+    // Danger audio pulse when high
+    if (state.starving >= 85) {
+      state.dangerPulseT += dt;
+      if (state.dangerPulseT >= 0.7) {
+        state.dangerPulseT = 0;
+        Audio.sfx('danger');
+      }
+    } else {
+      state.dangerPulseT = 0;
+    }
+  }
+
+  function update(dt){
+    state.tAlive += dt;
+
+    // power-up timers
+    if (state.magnetTime > 0) state.magnetTime = Math.max(0, state.magnetTime - dt);
+    if (state.slowTime > 0) state.slowTime = Math.max(0, state.slowTime - dt);
+
+    // dash timers
+    if (state.dashTime > 0) state.dashTime = Math.max(0, state.dashTime - dt);
+    if (state.dashCooldown > 0) state.dashCooldown = Math.max(0, state.dashCooldown - dt);
+
+    // slurp timers
+    if (state.slurpTime > 0) state.slurpTime = Math.max(0, state.slurpTime - dt);
+    if (state.slurpCooldown > 0) state.slurpCooldown = Math.max(0, state.slurpCooldown - dt);
+
+    // starvation always ticks
+    starvationTick(dt);
+    if (state.starving >= 100) { gameOver(); return; }
+
+    // slow-time scaling (helps in danger)
+    const slowFactor = (state.slowTime > 0) ? 0.62 : 1.0;
+    dt *= slowFactor;
+
+    // dash trigger
+    if (input.dash && state.dashCooldown <= 0 && state.dashTime <= 0) {
+      state.dashTime = 0.25;
+      state.dashCooldown = 1.25;
+      Audio.sfx('dash');
+    }
+
+    // slurp trigger
+    if (input.slurp && state.slurpCooldown <= 0 && state.slurpTime <= 0) {
+      state.slurpTime = 0.45;
+      state.slurpCooldown = 1.15;
+      Audio.sfx('slurp');
+    }
+
+    // movement
+    const dashMul = (state.dashTime > 0) ? 1.75 : 1.0;
+    gizmo.bob += dt * (Math.abs(gizmo.vx) > 1 ? 8 : 3);
+
+    if (input.mode === 'pointer' && input.targetX !== null) {
+      const dx = input.targetX - gizmo.x;
+      gizmo.vx = dx * 7 * dashMul;
+    } else {
+      let dir = 0;
+      if (input.left) dir -= 1;
+      if (input.right) dir += 1;
+      gizmo.vx = dir * gizmo.speed * dashMul;
+    }
+
+    gizmo.x += gizmo.vx * dt;
+    gizmo.x = clamp(gizmo.x, world.left()+10, world.right()-10);
+    gizmo.mouth = Math.max(0, gizmo.mouth - dt*4);
+
+    // difficulty label
+    state.level = 1 + Math.floor(state.tAlive / 18);
+
+    // spawn cadence (adaptive: easier when starving high)
+    const starvingEase = clamp((state.starving - 40) / 60, 0, 1); // 0..1
+    const comfort = clamp((60 - state.starving) / 60, 0, 1);
+    const diff = clamp(1 + (state.tAlive/35) + comfort*0.9, 1, 4.2);
+
+    const baseEvery = clamp(0.62 - diff*0.10 + starvingEase*0.10, 0.26, 0.70);
+    update.spawnT = (update.spawnT ?? 0) + dt;
+    while (update.spawnT >= baseEvery) {
+      update.spawnT -= baseEvery;
+      spawnScrap();
+      if (Math.random() < (0.04 + diff*0.02) && starvingEase < 0.8) spawnScrap();
+    }
+
+    // slurp effect
+    applySlurp(dt);
+
+    // scraps update + collision
+    const fy = world.floorY();
+    const catchW = 28, catchH = 18;
+    const catchX = gizmo.x - catchW/2;
+    const catchY = gizmo.y;
+
+    for (let i=state.scraps.length-1; i>=0; i--){
+      const s = state.scraps[i];
+
+      // magnet assistance for non-bad items
+      const baseMag = 0.08;
+      const powerMag = (state.magnetTime > 0) ? 0.40 : 0;
+      const magStrength = baseMag + powerMag;
+
+      if (!s.type.bad) {
+        const pull = clamp((gizmo.x - s.x) * 0.8, -60, 60);
+        s.vx += pull * magStrength * dt;
+      }
+
+      s.wT += dt * s.wob;
+      s.x += s.vx * dt + Math.sin(s.wT) * 4 * dt;
+      s.y += s.vy * dt;
+
+      if (s.x < world.left()+8){ s.x = world.left()+8; s.vx *= -0.35; }
+      if (s.x > world.right()-8){ s.x = world.right()-8; s.vx *= -0.35; }
+
+      if (s.sparkle) s.sparkle = (s.sparkle + dt*3) % 1;
+      if (s.pulled > 0) s.pulled = Math.max(0, s.pulled - dt);
+
+      const sx = s.x|0, sy = s.y|0;
+
+      // collision
+      if (sx >= catchX && sx <= catchX+catchW && sy >= catchY && sy <= catchY+catchH) {
+        state.scraps.splice(i,1);
+        gizmo.mouth = 1;
+        state.caught++;
+
+        // starvation delta
+        // Catch always helps (unless bad), and big streak gives a tiny extra “confidence snack”.
+        const streakTier = Math.min(4, Math.floor(state.streak / 6));
+        if (s.type.bad) {
+          state.streak = 0;
+          state.score = Math.max(0, state.score + s.type.base);
+          state.starving = clamp(state.starving + (10 + Math.abs(s.type.feed)), 0, 100);
+          Audio.sfx('bad');
+          pop(sx, sy, 18, ['#ff2b4f','#ff6aa6','#ffd35a']);
+          floatText(sx, sy-8, `NOPE: ${s.type.name}`, '#ff6aa6');
+        } else {
+          state.streak += 1;
+
+          const comboBonus = streakTier * 4;
+          const pts = Math.max(1, s.type.base + comboBonus);
+          state.score += pts;
+
+          const feedBonus = 1.5 * streakTier;
+          state.starving = clamp(state.starving - (s.type.feed + feedBonus), 0, 100);
+
+          if (s.type.onCatch) s.type.onCatch();
+
+          if (pts >= 30 || streakTier >= 3) Audio.sfx('bonus');
+          else Audio.sfx('catch');
+
+          pop(sx, sy, 12 + Math.floor(pts/9));
+          floatText(sx, sy-8, `+${pts}  ${s.type.name}`, '#eaf6ff');
+        }
+
+        if (state.starving >= 100) { gameOver(); return; }
+        continue;
+      }
+
+      // miss: allowed, but pushes starving up (challenge)
+      if (s.y > fy + 10) {
+        state.scraps.splice(i,1);
+        state.missed++;
+        if (state.streak > 0) state.streak = 0;
+
+        // Miss penalty increases slightly when you're doing well (prevents “AFK win”),
+        // but eases off when you're already near danger.
+        const dangerEase = clamp((state.starving - 70)/30, 0, 1); // 0..1
+        const missBase = 7.0 + clamp(state.tAlive/50, 0, 3.0);    // slowly ramps
+        const missBonus = (1 - dangerEase) * 2.5;                  // less extra when already struggling
+        state.starving = clamp(state.starving + missBase + missBonus, 0, 100);
+
+        // tiny score nudge (not the main punishment)
+        state.score = Math.max(0, state.score - 1);
+
+        Audio.sfx('miss');
+        pop(sx, fy, 10, ['#89d6ff','#eaf6ff','#56ff96']);
+        if (state.starving >= 100) { gameOver(); return; }
+      }
+    }
+
+    // particles
+    for (let i=state.particles.length-1; i>=0; i--){
+      const p = state.particles[i];
+      p.t += dt;
+      p.vy += p.g * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      if (p.t >= p.life) state.particles.splice(i,1);
+    }
+
+    // floaters
+    for (let i=state.floaters.length-1; i>=0; i--){
+      const f = state.floaters[i];
+      f.t += dt;
+      f.y += f.vy * dt;
+      if (f.t >= f.life) state.floaters.splice(i,1);
+    }
+  }
+
+  // ======== DRAW ========
+  function drawScrap(s){
+    const x = s.x|0, y = s.y|0;
+
+    pxFill(x-3, y+4, 6, 1, 'rgba(0,0,0,0.25)');
+    s.type.draw(x,y);
+
+    if (s.sparkle) {
+      const on = (s.sparkle < 0.33) || (s.sparkle > 0.66);
+      if (on) { pxFill(x-7,y-6,1,1,'#fff2b0'); pxFill(x+6,y-2,1,1,'#fff2b0'); pxFill(x-2,y+6,1,1,'#fff2b0'); }
+    }
+
+    if (s.pulled > 0) {
+      pxFill(x-6, y-6, 1, 1, 'rgba(137,214,255,0.7)');
+      pxFill(x+6, y-4, 1, 1, 'rgba(86,255,150,0.7)');
+    }
+  }
+
+  function drawParticles(){
+    for (const p of state.particles){
+      const a = 1 - (p.t / p.life);
+      bctx.globalAlpha = Math.max(0, Math.min(1, a));
+      pxFill(p.x|0, p.y|0, 2, 2, p.c);
+    }
+    bctx.globalAlpha = 1;
+  }
+
+  function drawFloaters(){
+    for (const f of state.floaters){
+      const a = 1 - (f.t / f.life);
+      bctx.globalAlpha = Math.max(0, Math.min(1, a));
+      pxText(f.msg, (f.x|0) - Math.floor((f.msg.length*4)), f.y|0, f.color);
+    }
+    bctx.globalAlpha = 1;
+  }
+
+  function render(){
+    bctx.clearRect(0,0,BW,BH);
+
+    drawBackground();
+    for (const s of state.scraps) drawScrap(s);
+    drawParticles();
+    drawGizmo();
+    drawFloaters();
+    drawHUD();
+    drawOverlay();
+
+    sctx.imageSmoothingEnabled = false;
+    sctx.clearRect(0,0,window.innerWidth, window.innerHeight);
+    sctx.drawImage(buf, 0, 0, BW, BH, ox, oy, BW*scale, BH*scale);
+
+    // vignette
+    sctx.save();
+    sctx.globalAlpha = 0.10;
+    const g = sctx.createRadialGradient(
+      window.innerWidth/2, window.innerHeight/2, Math.min(window.innerWidth, window.innerHeight)*0.2,
+      window.innerWidth/2, window.innerHeight/2, Math.max(window.innerWidth, window.innerHeight)*0.7
+    );
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(1, 'rgba(0,0,0,1)');
+    sctx.fillStyle = g;
+    sctx.fillRect(0,0,window.innerWidth, window.innerHeight);
+    sctx.restore();
+  }
+
+  // ======== MAIN LOOP ========
+  function loop(){
+    requestAnimationFrame(loop);
+
+    const t = now();
+    let dt = (t - state.lastT)/1000;
+    state.lastT = t;
+    dt = Math.min(dt, 0.05);
+
+    const isGameplayActive = (state.running && !state.paused);
+
+    if (isGameplayActive) update(dt);
+    render();
+
+    if (Audio.ctx) Audio.tickMusic(isGameplayActive);
+  }
+  loop();
+
+  // initial title state
+  state.running = false;
+  state.paused = true;
+})();
+</script>
+</body>
+</html>
